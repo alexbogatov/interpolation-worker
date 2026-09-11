@@ -1,559 +1,553 @@
-import os from 'os';
-import { stat } from 'fs/promises';
-import { spawn } from 'child_process';
-import { createReadStream, createWriteStream } from 'fs';
-import { mkdir, unlink, writeFile } from 'fs/promises';
-import { join } from 'path';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import pg from 'pg';
+import dotenv from 'dotenv';
 
-// ============================================
-// CONFIGURATION & CONSTANTS
-// ============================================
-const MACHINE_ID = os.hostname();
-const WORKER_SESSION_ID = process.env.WORKER_SESSION_ID;
-const WORKER_API_SECRET = process.env.WORKER_API_SECRET;
+dotenv.config();
 
-if (!WORKER_API_SECRET) {
-  console.error('[worker] FATAL: WORKER_API_SECRET environment variable is missing.');
+const { Pool } = pg;
+
+const required_env = [
+  'DB_HOST',
+  'DB_USER',
+  'DB_PASSWORD',
+  'DB_NAME',
+  'RUNLTX_API_BASE_URL',
+  'RUNLTX_API_KEY',
+  'RUNLTX_JOB_TYPE',
+  'RUNLTX_MODEL',
+  'RUNLTX_MULTIPLIER',
+  'VIDEO_BASE',
+  'REMOTE_DATA_BASE',
+  'FFPROBE_PATH'
+];
+
+for (const env_var of required_env) {
+  if (!process.env[env_var] || process.env[env_var].trim() === '') {
+    console.error(`FATAL: Missing required environment variable: ${env_var}`);
+    process.exit(1);
+  }
+}
+
+const execFileAsync = promisify(execFile);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: parseInt(process.env.DB_PORT || '5432', 10),
+  database: process.env.DB_NAME || 'airtix',
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD || '',
+  options: `-c search_path=${process.env.DB_SCHEMA || 'travel'},public`,
+});
+
+const RUNLTX_API_BASE_URL = process.env.RUNLTX_API_BASE_URL;
+const RUNLTX_API_KEY = process.env.RUNLTX_API_KEY;
+const RUNLTX_JOB_TYPE = process.env.RUNLTX_JOB_TYPE;
+const RUNLTX_MODEL = process.env.RUNLTX_MODEL;
+const RUNLTX_MULTIPLIER = parseInt(process.env.RUNLTX_MULTIPLIER, 10);
+
+if (isNaN(RUNLTX_MULTIPLIER)) {
+  console.error('FATAL: RUNLTX_MULTIPLIER must be a valid integer.');
   process.exit(1);
 }
 
-const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
-const JOB_TYPE = process.env.JOB_TYPE || 'interpolate';
-const MODEL = process.env.MODEL || 'interpolate-video';
-
-// Scaler & Worker Constraints
-const HARD_CAP_CONCURRENCY = 10;
-const INITIAL_CONCURRENCY = 4;
-const CPU_SCALE_THRESHOLD = 60.0;
-const CPU_SCALE_STEP = 2;
-
-const POLL_INTERVAL_MS = (parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 5) * 1000;
-const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
-const MAX_JOB_SECONDS = parseInt(process.env.MAX_JOB_SECONDS, 10) || 1800;
-const FFMPEG_BIN = process.env.FFMPEG_BIN || 'ffmpeg';
-
-const WORK_DIR = process.env.WORK_DIR || '/tmp/interpolator';
-const STATS_FILE = '/tmp/worker_stats.json';
-
-// Cloudflare R2 Credentials
-const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
-const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
-const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
-const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME;
-const R2_CDN_URL = process.env.R2_CDN_URL;
-
-const s3_client = new S3Client({
-  region: 'auto',
-  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  credentials: {
-    accessKeyId: R2_ACCESS_KEY_ID || '',
-    secretAccessKey: R2_SECRET_ACCESS_KEY || '',
-  },
-});
-
-let total_jobs_processed = 0;
-let total_generation_time_sec = 0;
-let consecutive_failures = 0;
-let is_shutting_down = false;
-
-// Dynamic Concurrency & Slot Management
-let current_target_concurrency = INITIAL_CONCURRENCY;
-const active_job_promises = new Set();
-const free_slots = Array.from({ length: HARD_CAP_CONCURRENCY }, (_, i) => i + 1);
-
-// Maps job_id -> { slot: number, frame: number, fps: number, total_frames: number }
-const active_progress_map = new Map();
-
-// Coordinator Queues
-const download_queue = []; // Items: { job_data, local_input_path }
-const upload_queue = [];   // Items: { job_id, local_output_path, generation_time_sec }
-const MAX_PREFETCH = 3;
-
-// ============================================
-// CPU SAMPLING & AUTOSCALER
-// ============================================
-const get_cpu_times = () => {
-  const cpus = os.cpus();
-  let idle = 0;
-  let total = 0;
-  for (const cpu of cpus) {
-    for (const type in cpu.times) {
-      total += cpu.times[type];
-    }
-    idle += cpu.times.idle;
-  }
-  return { idle, total };
-};
-
-const measure_cpu_percent = async (sample_duration_ms = 2000) => {
-  const start = get_cpu_times();
-  await new Promise((r) => setTimeout(r, sample_duration_ms));
-  const end = get_cpu_times();
-
-  const idle_delta = end.idle - start.idle;
-  const total_delta = end.total - start.total;
-  if (total_delta === 0) return 0;
-
-  return Math.max(0, Math.min(100, (1 - idle_delta / total_delta) * 100));
-};
-
-// Ramp Controller: Runs every 60 seconds
-setInterval(async () => {
-  if (is_shutting_down) return;
-
-  if (active_job_promises.size >= current_target_concurrency && current_target_concurrency < HARD_CAP_CONCURRENCY) {
-    const cpu_pct = await measure_cpu_percent(2000);
-
-    if (cpu_pct < CPU_SCALE_THRESHOLD) {
-      const added = Math.min(CPU_SCALE_STEP, HARD_CAP_CONCURRENCY - current_target_concurrency);
-      const old_target = current_target_concurrency;
-      current_target_concurrency += added;
-
-      console.log(
-        `\n\x1b[36m[Autoscaler] CPU at ${cpu_pct.toFixed(1)}% (< ${CPU_SCALE_THRESHOLD}%). ` +
-        `Ramping concurrency up: ${old_target} -> ${current_target_concurrency} (Cap: ${HARD_CAP_CONCURRENCY})\x1b[0m\n`
-      );
-    } else {
-      console.log(
-        `\n\x1b[33m[Autoscaler] CPU load at ${cpu_pct.toFixed(1)}% (>= ${CPU_SCALE_THRESHOLD}%). ` +
-        `Holding concurrency at ${current_target_concurrency}.\x1b[0m\n`
-      );
-    }
-  }
-}, 60 * 1000);
-
-// ============================================
-// PERIODIC SUMMARY PRINTER (Every 10 Seconds)
-// ============================================
-setInterval(() => {
-  if (active_progress_map.size === 0) return;
-
-  const entries = Array.from(active_progress_map.entries())
-    .sort((a, b) => a[1].slot - b[1].slot);
-
-  const formatted_cells = entries.map(([_, stats]) => {
-    const slot_str = String(stats.slot).padStart(2, '0');
-    const fr_str = String(stats.frame).padStart(4, ' ');
-    const fps_str = stats.fps > 0 ? stats.fps.toFixed(2).padStart(4, ' ') : '0.00';
-
-    const target = stats.total_frames || 288;
-    const pct = Math.min(100, Math.round((stats.frame / target) * 100));
-    const pct_str = String(pct).padStart(3, ' ');
-
-    return `[\x1b[90m ${slot_str} \x1b[0m] Fr: ${fr_str} | FPS: ${fps_str} | \x1b[36m${pct_str}%\x1b[0m`;
-  });
-
-  const COLS = 4;
-  const rows = [];
-  for (let i = 0; i < formatted_cells.length; i += COLS) {
-    rows.push(formatted_cells.slice(i, i + COLS).join('   '));
-  }
-
-  const TABLE_WIDTH = 113;
-  const timestamp = new Date().toISOString().split('T')[1].slice(0, 8);
-  const title_left = `--- [${timestamp}] Active Workers (${entries.length}/${current_target_concurrency}) [Cap: ${HARD_CAP_CONCURRENCY}] [Q_in: ${download_queue.length} | Q_out: ${upload_queue.length}] `;
-  const top_divider = title_left + '-'.repeat(Math.max(0, TABLE_WIDTH - title_left.length));
-  const bottom_divider = '-'.repeat(TABLE_WIDTH);
-
-  console.log(`\n${top_divider}`);
-  console.log(rows.join('\n'));
-  console.log(`${bottom_divider}\n`);
-}, 10000);
-
-// ============================================
-// HELPERS & STATS
-// ============================================
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const get_api_headers = () => ({
-  'worker-auth': WORKER_API_SECRET,
-  'x-machine-id': MACHINE_ID,
-  'content-type': 'application/json',
-});
-
-const sync_stats_file = async () => {
-  try {
-    const stats = {
-      jobs_processed: total_jobs_processed,
-      total_generation_time_sec: Math.round(total_generation_time_sec * 100) / 100,
-    };
-    await writeFile(STATS_FILE, JSON.stringify(stats));
-  } catch (_) {}
-};
-
-// ============================================
-// API CONTRACTS
-// ============================================
-const poll_for_job = async () => {
-  try {
-    const url = `${API_BASE_URL}/v1/worker/get`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: get_api_headers(),
-      body: JSON.stringify({
-        session_id: WORKER_SESSION_ID,
-        job_type: JOB_TYPE,
-        models: MODEL,
-      }),
-    });
-
-    if (response.status === 404) return null;
-    if (!response.ok) {
-      const err_text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${err_text}`);
-    }
-
-    return await response.json();
-  } catch (err) {
-    console.error('[api] Poll error:', err.message);
-    return null;
-  }
-};
-
-const complete_job = async (job_id, output_url, generation_time_sec) => {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const url = `${API_BASE_URL}/v1/worker/complete`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: get_api_headers(),
-        body: JSON.stringify({
-          session_id: WORKER_SESSION_ID,
-          job_id,
-          output_url,
-          generation_time_sec,
-        }),
-      });
-
-      if (!response.ok) {
-        const err_text = await response.text();
-        throw new Error(`HTTP ${response.status}: ${err_text}`);
-      }
-
-      return await response.json();
-    } catch (err) {
-      console.error(`[api] Complete attempt ${attempt} failed: ${err.message}`);
-      if (attempt < 3) await sleep(2000);
-    }
-  }
-};
-
-const fail_job = async (job_id, error_message) => {
-  try {
-    const url = `${API_BASE_URL}/v1/worker/fail`;
-    await fetch(url, {
-      method: 'POST',
-      headers: get_api_headers(),
-      body: JSON.stringify({
-        session_id: WORKER_SESSION_ID,
-        job_id,
-        error_message: typeof error_message === 'string' ? error_message : error_message?.message || 'Worker failure',
-      }),
-    });
-  } catch (err) {
-    console.error('[api] Fail report error:', err.message);
-  }
-};
-
-// ============================================
-// STORAGE & INTERPOLATION
-// ============================================
-const download_video = async (url, target_path) => {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
-  const file_stream = createWriteStream(target_path);
-  const reader = res.body.getReader();
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    file_stream.write(Buffer.from(value));
-  }
-  await new Promise((resolve) => file_stream.end(resolve));
-};
-
-const upload_to_r2 = async (file_path, job_id) => {
-  const key = `interpolations/${job_id}.mp4`;
-  const file_stats = await stat(file_path);
-  const file_stream = createReadStream(file_path);
-
-  await s3_client.send(
-    new PutObjectCommand({
-      Bucket: R2_BUCKET_NAME,
-      Key: key,
-      Body: file_stream,
-      ContentLength: file_stats.size,
-      ContentType: 'video/mp4',
-    })
-  );
-
-  return `${R2_CDN_URL}/${key}`;
-};
-
-const run_ffmpeg_interpolation = (input_path, output_path, job_id, slot_num) => {
-  return new Promise((resolve, reject) => {
-    active_progress_map.set(job_id, {
-      slot: slot_num,
-      frame: 0,
-      fps: 0,
-      total_frames: 288,
-    });
-
-    const args = [
-      '-y',
-      '-hide_banner',
-      '-loglevel', 'error',
-      '-progress', 'pipe:1',
-      '-nostats',
-      '-i', input_path,
-      '-filter:v', "setpts=4*PTS,minterpolate='fps=30:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'",
-      '-an',
-      '-c:v', 'libx264',
-      '-crf', '18',
-      '-preset', 'slow',
-      '-pix_fmt', 'yuv420p',
-      output_path,
-    ];
-
-    const child = spawn(FFMPEG_BIN, args);
-    let stderr_data = '';
-
-    const watchdog = setTimeout(() => {
-      child.kill('SIGKILL');
-      active_progress_map.delete(job_id);
-      reject(new Error(`FFmpeg timed out after ${MAX_JOB_SECONDS}s`));
-    }, MAX_JOB_SECONDS * 1000);
-
-    child.stdout.on('data', (chunk) => {
-      const lines = chunk.toString().split('\n');
-      const stats = active_progress_map.get(job_id);
-      if (!stats) return;
-
-      for (const line of lines) {
-        const [key, value] = line.split('=').map((s) => s?.trim());
-        if (!key || !value) continue;
-
-        if (key === 'frame') stats.frame = parseInt(value, 10) || 0;
-        if (key === 'fps') stats.fps = parseFloat(value) || 0;
-      }
-    });
-
-    child.stderr.on('data', (chunk) => {
-      stderr_data += chunk.toString();
-    });
-
-    child.on('close', (code) => {
-      clearTimeout(watchdog);
-      active_progress_map.delete(job_id);
-
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`FFmpeg error (${code}): ${stderr_data.trim()}`));
-      }
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(watchdog);
-      active_progress_map.delete(job_id);
-      reject(err);
-    });
-  });
-};
-
-// ============================================
-// COORDINATOR QUEUES (IN & OUT)
-// ============================================
-// 1. In-Queue: Download & Prefetch Loop
-(async function coordinator_download_loop() {
-  while (!is_shutting_down) {
-    if (download_queue.length >= MAX_PREFETCH) {
-      await sleep(1000);
-      continue;
-    }
-
-    const job_res = await poll_for_job();
-    if (!job_res || !job_res.success || !job_res.data) {
-      await sleep(POLL_INTERVAL_MS);
-      continue;
-    }
-
-    const job_data = job_res.data;
-    const job_id = job_data.job_id;
-    const video_url = job_data.input?.video_url || job_data.video_url;
-
-    if (!video_url) {
-      console.error(`[prefetch] Job [${job_id}] missing video_url`);
-      await fail_job(job_id, 'Missing video_url');
-      continue;
-    }
-
-    const local_input_path = join(WORK_DIR, `${job_id}.webm`);
-
-    try {
-      await download_video(video_url, local_input_path);
-      download_queue.push({ job_data, local_input_path });
-    } catch (err) {
-      console.error(`[prefetch] Failed download for [${job_id}]:`, err.message);
-      await fail_job(job_id, err.message);
-      try { await unlink(local_input_path); } catch (_) {}
-    }
-  }
-})();
-
-// 2. Out-Queue: Upload to R2 & Completion Reporter Loop
-(async function coordinator_upload_loop() {
-  while (!is_shutting_down || upload_queue.length > 0) {
-    if (upload_queue.length === 0) {
-      await sleep(500);
-      continue;
-    }
-
-    const item = upload_queue.shift();
-    const { job_id, slot_num, local_output_path, generation_time_sec } = item;
-
-    try {
-      const r2_url = await upload_to_r2(local_output_path, job_id);
-      await complete_job(job_id, r2_url, generation_time_sec);
-
-      total_jobs_processed++;
-      total_generation_time_sec += generation_time_sec;
-      consecutive_failures = 0;
-      await sync_stats_file();
-
-      console.log(
-        `\x1b[32m✔ [worker] Job [${job_id}] Slot [${String(slot_num).padStart(2, '0')}] ` +
-        `finished in ${generation_time_sec.toFixed(1)}s\x1b[0m -> ${r2_url}`
-      );
-    } catch (err) {
-      console.error(`[uploader] Failed push for [${job_id}]:`, err.message);
-      consecutive_failures++;
-      await fail_job(job_id, err.message);
-
-      if (consecutive_failures >= 50) {
-        console.error('[worker] FATAL: 50 consecutive failures. Exiting.');
-        process.exit(1);
-      }
-    } finally {
-      try { await unlink(local_output_path); } catch (_) {}
-    }
-  }
-})();
-
-// ============================================
-// COMPUTE EXECUTION HANDLER
-// ============================================
-const process_job_compute = async (job_data, input_path, slot_num) => {
-  const job_id = job_data.job_id;
-  const output_path = join(WORK_DIR, `${job_id}_slow4x.mp4`);
-  const start_time = Date.now();
-
-  console.log(`[worker] Started Job [${job_id}] in Slot [${String(slot_num).padStart(2, '0')}]`);
-
-  try {
-    await run_ffmpeg_interpolation(input_path, output_path, job_id, slot_num);
-
-    const generation_time_sec = (Date.now() - start_time) / 1000;
-
-    // Shift to asynchronous out-queue immediately to release compute slot
-    upload_queue.push({
-      job_id,
-      slot_num,
-      local_output_path: output_path,
-      generation_time_sec,
-    });
-  } catch (err) {
-    console.error(`[worker] Job [${job_id}] failed compute:`, err.message);
-    consecutive_failures++;
-    await fail_job(job_id, err.message);
-    try { await unlink(output_path); } catch (_) {}
-  } finally {
-    try { await unlink(input_path); } catch (_) {}
-  }
-};
-
-// ============================================
-// MAIN DISPATCH LOOP
-// ============================================
-const main = async () => {
-  console.log(
-    `[worker] Initializing on host: ${MACHINE_ID} ` +
-    `(Start: ${INITIAL_CONCURRENCY}, Cap: ${HARD_CAP_CONCURRENCY}, Threshold: ${CPU_SCALE_THRESHOLD}%)`
-  );
-
-  await mkdir(WORK_DIR, { recursive: true });
-  await sync_stats_file();
-
-  let empty_poll_count = 0;
-
-  while (!is_shutting_down) {
-    // Hold if active compute slots match target or no jobs downloaded yet
-    if (active_job_promises.size >= current_target_concurrency || free_slots.length === 0 || download_queue.length === 0) {
-      if (active_job_promises.size === 0 && download_queue.length === 0) {
-        empty_poll_count++;
-        if (empty_poll_count >= MAX_EMPTY_POLLS * 6) {
-          console.log('[worker] Queue dry. Inactivity limit reached. Shutting down...');
-          break;
-        }
-      } else {
-        empty_poll_count = 0;
-      }
-
-      await Promise.race([
-        ...active_job_promises,
-        sleep(500),
-      ]);
-      continue;
-    }
-
-    empty_poll_count = 0;
-    const { job_data, local_input_path } = download_queue.shift();
-    const slot_num = free_slots.shift();
-
-    const job_promise = (async () => {
-      try {
-        await process_job_compute(job_data, local_input_path, slot_num);
-      } finally {
-        free_slots.push(slot_num);
-        free_slots.sort((a, b) => a - b);
-        active_job_promises.delete(job_promise);
-      }
-    })();
-
-    active_job_promises.add(job_promise);
-    await sleep(200);
-  }
-
-  if (active_job_promises.size > 0) {
-    console.log(`[worker] Waiting for ${active_job_promises.size} running encodes to complete...`);
-    await Promise.all(active_job_promises);
-  }
-
-  // Drain upload queue
-  while (upload_queue.length > 0) {
-    console.log(`[worker] Draining upload queue (${upload_queue.length} files remaining)...`);
-    await sleep(1000);
-  }
-
-  process.exit(0);
-};
-
-const handle_exit = async () => {
-  console.log('[worker] Shutdown signal received. Draining workers and upload queue...');
-  is_shutting_down = true;
-  await Promise.all(active_job_promises);
-
-  while (upload_queue.length > 0) {
-    await sleep(1000);
-  }
-  process.exit(0);
-};
-
-process.on('SIGINT', handle_exit);
-process.on('SIGTERM', handle_exit);
-
-main().catch((err) => {
-  console.error('[worker] Unhandled fatal exception:', err);
+const VIDEO_BASE = process.env.VIDEO_BASE;
+const REMOTE_DATA_BASE = process.env.REMOTE_DATA_BASE;
+const FFPROBE_BIN = process.env.FFPROBE_PATH;
+
+if (!fs.existsSync(FFPROBE_BIN)) {
+  console.error(`FATAL: FFPROBE binary not found on disk at: ${FFPROBE_BIN}`);
   process.exit(1);
-});
+}
+
+// Probes both dimensions and duration to confirm slow-motion / length expansion
+async function get_video_metadata(file_path) {
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      FFPROBE_BIN,
+      [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height,duration:format=duration',
+        '-of', 'json',
+        file_path
+      ]
+    );
+
+    if (stderr && stderr.trim().length > 0) {
+      console.warn(`[FFPROBE STDERR] ${file_path}: ${stderr.trim()}`);
+    }
+
+    const info = JSON.parse(stdout);
+    const stream = info.streams?.[0];
+    const duration = parseFloat(stream?.duration || info.format?.duration || '0');
+
+    if (stream && stream.width > 0 && stream.height > 0) {
+      return {
+        width: stream.width,
+        height: stream.height,
+        duration: duration
+      };
+    } else {
+      console.error(`[FFPROBE ERROR] No valid stream found for ${file_path}. Raw stdout:`, stdout);
+    }
+  } catch (err) {
+    console.error(`[FFPROBE EXEC ERROR] Failed to probe ${file_path}:`);
+    console.error(`  Message: ${err.message}`);
+    if (err.code) console.error(`  Exit Code: ${err.code}`);
+    if (err.stderr) console.error(`  Stderr: ${err.stderr}`);
+  }
+  return null;
+}
+
+async function find_valid_interpolated_file_on_disk(interpolated_dir, seq_str) {
+  if (!fs.existsSync(interpolated_dir)) return null;
+  const files = await fs.promises.readdir(interpolated_dir);
+  for (const file of files) {
+    if (file.startsWith(seq_str + '.')) {
+      const full_path = path.join(interpolated_dir, file);
+      const meta = await get_video_metadata(full_path);
+      // Ensure file exists, has valid dimensions, and expanded beyond original short clip length (> 5s)
+      if (meta && meta.duration > 5) {
+        const stat = await fs.promises.stat(full_path);
+        return {
+          filename: file,
+          filepath: full_path,
+          size: stat.size,
+          width: meta.width,
+          height: meta.height,
+          duration: meta.duration
+        };
+      }
+    }
+  }
+  return null;
+}
+
+async function find_source_upscaled_filename(upscaled_dir, seq_str) {
+  if (!fs.existsSync(upscaled_dir)) return null;
+  const files = await fs.promises.readdir(upscaled_dir);
+  for (const file of files) {
+    if (file.startsWith(seq_str + '.')) {
+      return file;
+    }
+  }
+  return null;
+}
+
+async function download_file(url, destination_path) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP download error! status: ${res.status}`);
+  const array_buffer = await res.arrayBuffer();
+  const buffer = Buffer.from(array_buffer);
+  await fs.promises.writeFile(destination_path, buffer);
+}
+
+async function submit_runltx_interpolation_job(video_url) {
+  const res = await fetch(`${RUNLTX_API_BASE_URL}/v1/process`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': RUNLTX_API_KEY
+    },
+    body: JSON.stringify({
+      job_type: RUNLTX_JOB_TYPE,
+      model: RUNLTX_MODEL,
+      video_url: video_url,
+      multiplier: RUNLTX_MULTIPLIER
+    })
+  });
+
+  const json = await res.json();
+  if (!res.ok || !json.success || !json.data?.job_id) {
+    throw new Error(json.message || `Failed submission HTTP ${res.status}`);
+  }
+  return json.data.job_id;
+}
+
+async function check_runltx_job_status(job_id) {
+  const res = await fetch(`${RUNLTX_API_BASE_URL}/v1/job/${job_id}`, {
+    method: 'GET',
+    headers: { 'x-api-key': RUNLTX_API_KEY }
+  });
+  const json = await res.json();
+  if (!res.ok || !json.success || !json.data) {
+    throw new Error(json.message || `Job query failed HTTP ${res.status}`);
+  }
+  return {
+    status: json.data.status,
+    output_url: json.data.output_url,
+    error: json.data.error_message
+  };
+}
+
+async function get_global_pipeline_state(client) {
+  const video_counts = await client.query(`
+    SELECT 
+      COUNT(*)::int AS total_videos,
+      COUNT(CASE WHEN interpolated_at IS NOT NULL THEN 1 END)::int AS videos_completed,
+      COUNT(CASE WHEN upscaled_at IS NOT NULL AND interpolated_at IS NULL THEN 1 END)::int AS videos_pending_interpolation
+    FROM t_videos
+  `);
+
+  const image_counts = await client.query(`
+    SELECT 
+      COUNT(*)::int AS total_images,
+      COUNT(CASE WHEN interpolation_finished_at IS NOT NULL THEN 1 END)::int AS clips_interpolated,
+      COUNT(CASE WHEN interpolation_job_id IS NOT NULL AND interpolation_finished_at IS NULL THEN 1 END)::int AS jobs_in_flight
+    FROM t_hotel_images
+  `);
+
+  const v = video_counts.rows[0];
+  const img = image_counts.rows[0];
+
+  return {
+    'Total Videos': v.total_videos,
+    'Videos Interpolated': v.videos_completed,
+    'Videos Pending Interpolation': v.videos_pending_interpolation,
+    'Total Hotel Images': img.total_images,
+    'Clips Finished Interpolation': img.clips_interpolated,
+    'Active Queued Interpolation Jobs': img.jobs_in_flight
+  };
+}
+
+async function run_interpolation_pipeline() {
+  const start_time = Date.now();
+  const client = await pool.connect();
+
+  const stats = {
+    videos_scanned: 0,
+    videos_completed: 0,
+    videos_pending: 0,
+    videos_skipped_parse_error: 0,
+    images_evaluated: 0,
+    clips_found_on_disk: 0,
+    clips_downloaded: 0,
+    clips_queued_new: 0,
+    clips_still_in_flight: 0,
+    verification_warnings: 0,
+    jobs_failed_resubmitted: 0,
+    api_errors: 0
+  };
+
+  try {
+    console.log('Connected to PostgreSQL Database.');
+    console.log(`Using ffprobe executable at: "${FFPROBE_BIN}"`);
+
+    const video_result = await client.query(`
+      SELECT id, hotel_id, image_data
+      FROM t_videos
+      WHERE upscaled_at IS NOT NULL
+        AND interpolated_at IS NULL
+        AND image_data IS NOT NULL
+      ORDER BY id ASC
+    `);
+
+    stats.videos_scanned = video_result.rows.length;
+
+    if (stats.videos_scanned === 0) {
+      console.log('\nNo pending videos found to interpolate clips for.');
+      return;
+    }
+
+    console.log(`\nLoaded ${stats.videos_scanned} pending video(s) for interpolation pipeline.`);
+
+    for (const video_row of video_result.rows) {
+      const video_id = video_row.id;
+      const hotel_id = video_row.hotel_id;
+      const folder_name = String(hotel_id).padStart(8, '0');
+      const hotel_dir = path.join(VIDEO_BASE, folder_name);
+      const upscaled_dir = path.join(hotel_dir, '004.upscaled');
+      const interpolated_dir = path.join(hotel_dir, '006.interpolated');
+
+      console.log(`\n======================================================`);
+      console.log(`Processing Video ID: ${video_id} | Hotel ID: ${hotel_id}`);
+      console.log(`Target Interpolated Directory: ${interpolated_dir}`);
+      console.log(`======================================================`);
+
+      const raw_image_data = video_row.image_data;
+      let image_list = [];
+
+      try {
+        if (typeof raw_image_data === 'string') {
+          image_list = JSON.parse(raw_image_data);
+        } else if (Array.isArray(raw_image_data)) {
+          image_list = raw_image_data;
+        } else if (typeof raw_image_data === 'object' && raw_image_data !== null) {
+          image_list = raw_image_data;
+        }
+      } catch (err) {
+        console.error(`Failed to parse image_data JSON for video ${video_id}:`, err.message);
+        stats.videos_skipped_parse_error++;
+        continue;
+      }
+
+      if (!Array.isArray(image_list) || image_list.length === 0) {
+        console.warn(`Video ${video_id} has empty image list. Skipping.`);
+        continue;
+      }
+
+      if (!fs.existsSync(interpolated_dir)) {
+        await fs.promises.mkdir(interpolated_dir, { recursive: true });
+      }
+
+      let all_selected_completed = true;
+
+      for (const img of image_list) {
+        if (!img.classification?.selected) continue;
+
+        stats.images_evaluated++;
+        const seq_num = img.classification.sequence_num;
+        const seq_str = String(seq_num).padStart(3, '0');
+
+        if (!img.interpolation || typeof img.interpolation !== 'object') {
+          img.interpolation = {
+            job_id: null,
+            completed: false,
+            filename: null,
+            filepath: null,
+            width: null,
+            height: null,
+            duration: null
+          };
+        }
+
+        // Branch 1: Disk-First Check
+        const existing_on_disk = await find_valid_interpolated_file_on_disk(interpolated_dir, seq_str);
+        if (existing_on_disk) {
+          console.log(
+            `[DISK TRUTH] Valid interpolated clip on disk: ${existing_on_disk.filename} ` +
+            `(${existing_on_disk.width}x${existing_on_disk.height}, ${existing_on_disk.duration.toFixed(2)}s)`
+          );
+          stats.clips_found_on_disk++;
+
+          img.interpolation.completed = true;
+          img.interpolation.filename = existing_on_disk.filename;
+          img.interpolation.filepath = existing_on_disk.filepath;
+          img.interpolation.width = existing_on_disk.width;
+          img.interpolation.height = existing_on_disk.height;
+          img.interpolation.duration = existing_on_disk.duration;
+
+          await client.query(`
+            UPDATE t_hotel_images
+            SET interpolation_finished_at = CURRENT_TIMESTAMP,
+                interpolation_filename = $1
+            WHERE id = $2
+          `, [existing_on_disk.filepath, img.image_id]);
+          continue;
+        }
+
+        // Reset if metadata marked complete, but clip missing/invalid on disk
+        if (img.interpolation.completed === true) {
+          console.warn(`[DISK TRUTH] Metadata marked complete, but clip missing/invalid on disk. Resetting: ${seq_str}`);
+          img.interpolation.completed = false;
+          img.interpolation.filename = null;
+          img.interpolation.filepath = null;
+          img.interpolation.width = null;
+          img.interpolation.height = null;
+          img.interpolation.duration = null;
+        }
+
+        // Branch 2: In-Flight Job Polling
+        let job_id = img.interpolation.job_id;
+        if (!job_id) {
+          const db_job_res = await client.query(
+            `SELECT interpolation_job_id FROM t_hotel_images WHERE id = $1`,
+            [img.image_id]
+          );
+          job_id = db_job_res.rows[0]?.interpolation_job_id || null;
+          if (job_id) img.interpolation.job_id = job_id;
+        }
+
+        let needs_submission = !job_id;
+
+        if (job_id) {
+          console.log(`[POLL] Checking in-flight interpolation job ${job_id} for sequence ${seq_str}...`);
+          try {
+            const check = await check_runltx_job_status(job_id);
+
+            if (check.status === 'COMPLETED' && check.output_url) {
+              console.log(`[POLL] Job ${job_id} COMPLETED. Downloading clip...`);
+              const url_ext = path.extname(new URL(check.output_url).pathname) || '.mp4';
+              const target_filename = `${seq_str}${url_ext}`;
+              const target_filepath = path.join(interpolated_dir, target_filename);
+
+              await download_file(check.output_url, target_filepath);
+
+              const meta = await get_video_metadata(target_filepath);
+              if (meta && meta.duration > 5) {
+                const stat = await fs.promises.stat(target_filepath);
+                const size_mb = (stat.size / (1024 * 1024)).toFixed(2);
+
+                console.log(
+                  `[POLL] ✅ Clip verified & saved: ${target_filename} ` +
+                  `(${meta.width}x${meta.height}, ${meta.duration.toFixed(2)}s, ${size_mb} MB) -> ${target_filepath}`
+                );
+
+                stats.clips_downloaded++;
+                img.interpolation.completed = true;
+                img.interpolation.filename = target_filename;
+                img.interpolation.filepath = target_filepath;
+                img.interpolation.width = meta.width;
+                img.interpolation.height = meta.height;
+                img.interpolation.duration = meta.duration;
+
+                await client.query(`
+                  UPDATE t_hotel_images
+                  SET interpolation_finished_at = CURRENT_TIMESTAMP,
+                      interpolation_filename = $1
+                  WHERE id = $2
+                `, [target_filepath, img.image_id]);
+                continue;
+              } else {
+                console.warn(`[PROBE WARNING] Clip downloaded but failed duration check: ${target_filename}. Leaving file intact. NOT resubmitting.`);
+                stats.verification_warnings++;
+                all_selected_completed = false;
+                continue;
+              }
+
+            } else if (check.status === 'FAILED' || check.status === 'NOT-FOUND') {
+              console.warn(`[POLL] Job ${job_id} '${check.status}'. Cleaning up and triggering immediate re-submission for ${seq_str}.`);
+              stats.jobs_failed_resubmitted++;
+              img.interpolation.job_id = null;
+              needs_submission = true;
+
+              await client.query(`
+                UPDATE t_hotel_images
+                SET interpolation_job_id = NULL,
+                    interpolation_started_at = NULL,
+                    interpolation_filename = NULL
+                WHERE id = $1
+              `, [img.image_id]);
+
+            } else {
+              console.log(`[POLL] Job ${job_id} status: ${check.status}. Continuing without waiting.`);
+              stats.clips_still_in_flight++;
+              all_selected_completed = false;
+              continue;
+            }
+          } catch (status_err) {
+            console.error(`[POLL] Failed to check interpolation job ${job_id}:`, status_err.message);
+            stats.api_errors++;
+            all_selected_completed = false;
+            continue;
+          }
+        }
+
+        // Branch 3: Initial or Retry Submission
+        if (needs_submission) {
+          all_selected_completed = false;
+
+          let source_file = img.upscaling?.filename;
+          if (!source_file) {
+            source_file = await find_source_upscaled_filename(upscaled_dir, seq_str);
+          }
+
+          if (!source_file) {
+            console.error(`[API] Cannot submit interpolation job for sequence ${seq_str}: Source upscaled video not found in ${upscaled_dir}`);
+            continue;
+          }
+
+          const remote_video_url = `${REMOTE_DATA_BASE}/${folder_name}/004.upscaled/${source_file}`;
+
+          try {
+            const new_job_id = await submit_runltx_interpolation_job(remote_video_url);
+            stats.clips_queued_new++;
+
+            img.interpolation.job_id = new_job_id;
+            img.interpolation.completed = false;
+            img.interpolation.filename = null;
+            img.interpolation.filepath = null;
+            img.interpolation.width = null;
+            img.interpolation.height = null;
+            img.interpolation.duration = null;
+            img.interpolation.source_url = remote_video_url;
+
+            await client.query(`
+              UPDATE t_hotel_images
+              SET interpolation_job_id = $1,
+                  interpolation_started_at = CURRENT_TIMESTAMP,
+                  interpolation_finished_at = NULL,
+                  interpolation_filename = NULL
+              WHERE id = $2
+            `, [new_job_id, img.image_id]);
+
+            console.log(`[API] Successfully queued interpolation job: ${new_job_id} for sequence ${seq_str}`);
+          } catch (submit_err) {
+            console.error(`[API] Failed to submit interpolation job for ${seq_str}:`, submit_err.message);
+            stats.api_errors++;
+            img.interpolation.job_id = null;
+          }
+        }
+      }
+
+      // Finalize video row state
+      const formatted_json = JSON.stringify(image_list, null, 2);
+
+      if (all_selected_completed) {
+        console.log(`\n[ALL COMPLETE] All selected interpolated clips verified on disk for Video ID: ${video_id}`);
+        stats.videos_completed++;
+        await client.query(`
+          UPDATE t_videos
+          SET image_data = $1,
+              updated_at = CURRENT_TIMESTAMP,
+              interpolated_at = CURRENT_TIMESTAMP
+          WHERE id = $2
+        `, [formatted_json, video_id]);
+      } else {
+        console.log(`\n[PENDING JOBS] Video ID ${video_id} has interpolation jobs in flight, queued, or awaiting verification.`);
+        stats.videos_pending++;
+        await client.query(`
+          UPDATE t_videos
+          SET image_data = $1,
+              updated_at = CURRENT_TIMESTAMP,
+              interpolated_at = NULL
+          WHERE id = $2
+        `, [formatted_json, video_id]);
+      }
+
+    //   console.log('Debug, exiting');
+    //   break;
+    }
+
+    const elapsed_seconds = ((Date.now() - start_time) / 1000).toFixed(2);
+
+    console.log('\n======================================================');
+    console.log('              THIS RUN (CYCLE DELTA)                  ');
+    console.log('======================================================');
+    console.table({
+      'Videos Processed': stats.videos_scanned > 0 ? (stats.videos_completed + stats.videos_pending) : 0,
+      'Videos Fully Completed': stats.videos_completed,
+      'Selected Images Evaluated': stats.images_evaluated,
+      'Clips Valid on Disk': stats.clips_found_on_disk,
+      'New Clips Downloaded': stats.clips_downloaded,
+      'New Video Jobs Queued': stats.clips_queued_new,
+      'Jobs Still In Flight': stats.clips_still_in_flight,
+      'Probe Warnings (Preserved)': stats.verification_warnings,
+      'Failed Jobs Cleaned & Re-Queued': stats.jobs_failed_resubmitted,
+      'API / Network Errors': stats.api_errors,
+      'Run Time (seconds)': elapsed_seconds
+    });
+
+    console.log('\n======================================================');
+    console.log('          OVERALL PIPELINE STATE (GLOBAL DB)           ');
+    console.log('======================================================');
+    const global_stats = await get_global_pipeline_state(client);
+    console.table(global_stats);
+    console.log('======================================================\n');
+
+  } catch (err) {
+    console.error('Pipeline error:', err);
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}
+
+run_interpolation_pipeline();
