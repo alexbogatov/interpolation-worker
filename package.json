@@ -1,0 +1,11 @@
+{
+  "name": "ffmpeg-interpolate-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.500.0"
+  }
+}
