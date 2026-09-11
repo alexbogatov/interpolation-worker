@@ -21,7 +21,7 @@ const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
 const JOB_TYPE = process.env.JOB_TYPE || 'interpolate';
 const MODEL = process.env.MODEL || 'interpolate-video';
 
-const CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || 8;
+const CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || 16;
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 5) * 1000;
 const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
 const MAX_JOB_SECONDS = parseInt(process.env.MAX_JOB_SECONDS, 10) || 1800;
@@ -51,8 +51,46 @@ let total_generation_time_sec = 0;
 let consecutive_failures = 0;
 let is_shutting_down = false;
 
-// Track active background job promises
+// Concurrency pool & Slot tracker
 const active_job_promises = new Set();
+const free_slots = Array.from({ length: CONCURRENCY }, (_, i) => i + 1);
+
+// Maps job_id -> { slot: number, frame: number, fps: number, total_frames: number }
+const active_progress_map = new Map();
+
+// ============================================
+// PERIODIC SUMMARY PRINTER (Compact 4 Per Line)
+// ============================================
+setInterval(() => {
+  if (active_progress_map.size === 0) return;
+
+  const entries = Array.from(active_progress_map.entries())
+    .sort((a, b) => a[1].slot - b[1].slot);
+
+  const formatted_cells = entries.map(([_, stats]) => {
+    const slot_str = String(stats.slot).padStart(2, '0');
+    const fr_str = String(stats.frame).padStart(4, ' ');
+    const fps_str = stats.fps > 0 ? stats.fps.toFixed(2).padStart(4, ' ') : '0.00';
+    
+    // 288 frames target for ~2.4s at 4x slow-mo (30fps)
+    const target = stats.total_frames || 288;
+    const pct = Math.min(100, Math.round((stats.frame / target) * 100));
+    const pct_str = String(pct).padStart(3, ' ');
+
+    return `[ ${slot_str} ] Fr: ${fr_str} | FPS: ${fps_str} | ${pct_str}%`;
+  });
+
+  const COLS = 4;
+  const rows = [];
+  for (let i = 0; i < formatted_cells.length; i += COLS) {
+    rows.push(formatted_cells.slice(i, i + COLS).join('   '));
+  }
+
+  const timestamp = new Date().toISOString().split('T')[1].slice(0, 8);
+  console.log(`\n--- [${timestamp}] Active Workers (${entries.length}/${CONCURRENCY}) ---`);
+  console.log(rows.join('\n'));
+  console.log('--------------------------------------------------------------------------------\n');
+}, 5000);
 
 // ============================================
 // HELPERS & STATS
@@ -150,7 +188,7 @@ const fail_job = async (job_id, error_message) => {
 };
 
 // ============================================
-// I/O & INTERPOLATION PIPELINE
+// STORAGE & INTERPOLATION
 // ============================================
 const download_video = async (url, target_path) => {
   const res = await fetch(url);
@@ -180,12 +218,21 @@ const upload_to_r2 = async (file_path, job_id) => {
   return `${R2_CDN_URL}/${key}`;
 };
 
-const run_ffmpeg_interpolation = (input_path, output_path) => {
+const run_ffmpeg_interpolation = (input_path, output_path, job_id, slot_num) => {
   return new Promise((resolve, reject) => {
+    active_progress_map.set(job_id, {
+      slot: slot_num,
+      frame: 0,
+      fps: 0,
+      total_frames: 288
+    });
+
     const args = [
       '-y',
       '-hide_banner',
       '-loglevel', 'error',
+      '-progress', 'pipe:1',
+      '-nostats',
       '-i', input_path,
       '-filter:v', "setpts=4*PTS,minterpolate='fps=30:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'",
       '-an',
@@ -201,8 +248,23 @@ const run_ffmpeg_interpolation = (input_path, output_path) => {
 
     const watchdog = setTimeout(() => {
       child.kill('SIGKILL');
+      active_progress_map.delete(job_id);
       reject(new Error(`FFmpeg timed out after ${MAX_JOB_SECONDS}s`));
     }, MAX_JOB_SECONDS * 1000);
+
+    child.stdout.on('data', (chunk) => {
+      const lines = chunk.toString().split('\n');
+      const stats = active_progress_map.get(job_id);
+      if (!stats) return;
+
+      for (const line of lines) {
+        const [key, value] = line.split('=').map((s) => s?.trim());
+        if (!key || !value) continue;
+
+        if (key === 'frame') stats.frame = parseInt(value, 10) || 0;
+        if (key === 'fps') stats.fps = parseFloat(value) || 0;
+      }
+    });
 
     child.stderr.on('data', (chunk) => {
       stderr_data += chunk.toString();
@@ -210,15 +272,18 @@ const run_ffmpeg_interpolation = (input_path, output_path) => {
 
     child.on('close', (code) => {
       clearTimeout(watchdog);
+      active_progress_map.delete(job_id);
+
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`FFmpeg exited with code ${code}: ${stderr_data.trim()}`));
+        reject(new Error(`FFmpeg error (${code}): ${stderr_data.trim()}`));
       }
     });
 
     child.on('error', (err) => {
       clearTimeout(watchdog);
+      active_progress_map.delete(job_id);
       reject(err);
     });
   });
@@ -227,7 +292,7 @@ const run_ffmpeg_interpolation = (input_path, output_path) => {
 // ============================================
 // JOB PROCESSOR
 // ============================================
-const process_job = async (job_data) => {
+const process_job = async (job_data, slot_num) => {
   const job_id = job_data.job_id;
   const video_url = job_data.input?.video_url || job_data.video_url;
 
@@ -241,11 +306,11 @@ const process_job = async (job_data) => {
   const output_path = join(WORK_DIR, `${job_id}_slow4x.mp4`);
   const start_time = Date.now();
 
-  console.log(`[worker] Started Job [${job_id}] (Active slots: ${active_job_promises.size})`);
+  console.log(`[worker] Started Job [${job_id}] in Slot [${String(slot_num).padStart(2, '0')}]`);
 
   try {
     await download_video(video_url, input_path);
-    await run_ffmpeg_interpolation(input_path, output_path);
+    await run_ffmpeg_interpolation(input_path, output_path, job_id, slot_num);
     const r2_url = await upload_to_r2(output_path, job_id);
 
     const generation_time = (Date.now() - start_time) / 1000;
@@ -256,7 +321,7 @@ const process_job = async (job_data) => {
     consecutive_failures = 0;
     await sync_stats_file();
 
-    console.log(`\x1b[32m✔ [worker] Job [${job_id}] completed in ${generation_time.toFixed(1)}s\x1b[0m -> ${r2_url}`);
+    console.log(`\x1b[32m✔ [worker] Job [${job_id}] Slot [${String(slot_num).padStart(2, '0')}] finished in ${generation_time.toFixed(1)}s\x1b[0m -> ${r2_url}`);
   } catch (err) {
     console.error(`[worker] Job [${job_id}] failed:`, err.message);
     consecutive_failures++;
@@ -273,7 +338,7 @@ const process_job = async (job_data) => {
 };
 
 // ============================================
-// MAIN EVENT LOOP
+// MAIN LOOP
 // ============================================
 const main = async () => {
   console.log(`[worker] Initializing on host: ${MACHINE_ID} (Max Concurrency: ${CONCURRENCY})`);
@@ -284,8 +349,7 @@ const main = async () => {
   let empty_poll_count = 0;
 
   while (!is_shutting_down) {
-    // If worker capacity is full, wait for any active job to finish
-    if (active_job_promises.size >= CONCURRENCY) {
+    if (active_job_promises.size >= CONCURRENCY || free_slots.length === 0) {
       await Promise.race(active_job_promises);
       continue;
     }
@@ -293,7 +357,6 @@ const main = async () => {
     const job_res = await poll_for_job();
 
     if (!job_res || !job_res.success || !job_res.data) {
-      // Only count empty polls if there are NO jobs currently running
       if (active_job_promises.size === 0) {
         empty_poll_count++;
         console.log(`[worker] Queue dry (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
@@ -308,25 +371,23 @@ const main = async () => {
       continue;
     }
 
-    // Reset empty poll count on job arrival
     empty_poll_count = 0;
+    const slot_num = free_slots.shift();
 
-    // Track active job execution in the concurrency pool
     const job_promise = (async () => {
       try {
-        await process_job(job_res.data);
+        await process_job(job_res.data, slot_num);
       } finally {
+        free_slots.push(slot_num);
+        free_slots.sort((a, b) => a - b);
         active_job_promises.delete(job_promise);
       }
     })();
 
     active_job_promises.add(job_promise);
-
-    // Yield loop briefly before claiming the next slot
     await sleep(200);
   }
 
-  // Drain all running jobs before container termination
   if (active_job_promises.size > 0) {
     console.log(`[worker] Waiting for ${active_job_promises.size} running jobs to finish...`);
     await Promise.all(active_job_promises);
