@@ -1,4 +1,5 @@
 import os from 'os';
+import { stat } from 'fs/promises';
 import { spawn } from 'child_process';
 import { createReadStream, createWriteStream } from 'fs';
 import { mkdir, unlink, writeFile } from 'fs/promises';
@@ -21,7 +22,10 @@ const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
 const JOB_TYPE = process.env.JOB_TYPE || 'interpolate';
 const MODEL = process.env.MODEL || 'interpolate-video';
 
-const CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || 16;
+const TOTAL_CORES = os.cpus().length;
+const HARD_CAP_CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || TOTAL_CORES;
+const INITIAL_CONCURRENCY = Math.min(5, HARD_CAP_CONCURRENCY);
+
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 5) * 1000;
 const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
 const MAX_JOB_SECONDS = parseInt(process.env.MAX_JOB_SECONDS, 10) || 1800;
@@ -51,15 +55,70 @@ let total_generation_time_sec = 0;
 let consecutive_failures = 0;
 let is_shutting_down = false;
 
-// Concurrency pool & Slot tracker
+// Dynamic Concurrency & Slot Tracker
+let current_target_concurrency = INITIAL_CONCURRENCY;
 const active_job_promises = new Set();
-const free_slots = Array.from({ length: CONCURRENCY }, (_, i) => i + 1);
+const free_slots = Array.from({ length: HARD_CAP_CONCURRENCY }, (_, i) => i + 1);
 
 // Maps job_id -> { slot: number, frame: number, fps: number, total_frames: number }
 const active_progress_map = new Map();
 
 // ============================================
-// PERIODIC SUMMARY PRINTER (Compact 4 Per Line)
+// CPU LOAD SAMPLER & AUTOSCALER
+// ============================================
+const get_cpu_times = () => {
+  const cpus = os.cpus();
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus) {
+    for (const type in cpu.times) {
+      total += cpu.times[type];
+    }
+    idle += cpu.times.idle;
+  }
+  return { idle, total };
+};
+
+const measure_cpu_percent = async (sample_duration_ms = 2000) => {
+  const start = get_cpu_times();
+  await new Promise((r) => setTimeout(r, sample_duration_ms));
+  const end = get_cpu_times();
+
+  const idle_delta = end.idle - start.idle;
+  const total_delta = end.total - start.total;
+  if (total_delta === 0) return 0;
+
+  return Math.max(0, Math.min(100, (1 - idle_delta / total_delta) * 100));
+};
+
+// Ramp Controller: Runs every 60 seconds
+setInterval(async () => {
+  if (is_shutting_down) return;
+
+  // Only scale up if all existing slots are utilized and under hard cap
+  if (active_job_promises.size >= current_target_concurrency && current_target_concurrency < HARD_CAP_CONCURRENCY) {
+    const cpu_pct = await measure_cpu_percent(2000);
+
+    if (cpu_pct < 90.0) {
+      const added = Math.min(2, HARD_CAP_CONCURRENCY - current_target_concurrency);
+      const old_target = current_target_concurrency;
+      current_target_concurrency += added;
+
+      console.log(
+        `\n\x1b[36m[Autoscaler] CPU at ${cpu_pct.toFixed(1)}% (< 90%). ` +
+        `Ramping concurrency up: ${old_target} -> ${current_target_concurrency} (Cap: ${HARD_CAP_CONCURRENCY})\x1b[0m\n`
+      );
+    } else {
+      console.log(
+        `\n\x1b[33m[Autoscaler] CPU saturated at ${cpu_pct.toFixed(1)}% (>= 90%). ` +
+        `Holding concurrency at ${current_target_concurrency}.\x1b[0m\n`
+      );
+    }
+  }
+}, 60 * 1000);
+
+// ============================================
+// PERIODIC SUMMARY PRINTER (Every 10 Seconds)
 // ============================================
 setInterval(() => {
   if (active_progress_map.size === 0) return;
@@ -72,7 +131,6 @@ setInterval(() => {
     const fr_str = String(stats.frame).padStart(4, ' ');
     const fps_str = stats.fps > 0 ? stats.fps.toFixed(2).padStart(4, ' ') : '0.00';
     
-    // 288 frames target for ~2.4s at 4x slow-mo (30fps)
     const target = stats.total_frames || 288;
     const pct = Math.min(100, Math.round((stats.frame / target) * 100));
     const pct_str = String(pct).padStart(3, ' ');
@@ -87,10 +145,10 @@ setInterval(() => {
   }
 
   const timestamp = new Date().toISOString().split('T')[1].slice(0, 8);
-  console.log(`\n--- [${timestamp}] Active Workers (${entries.length}/${CONCURRENCY}) ---`);
+  console.log(`\n--- [${timestamp}] Active Workers (${entries.length}/${current_target_concurrency}) [Cap: ${HARD_CAP_CONCURRENCY}] ---`);
   console.log(rows.join('\n'));
   console.log('--------------------------------------------------------------------------------\n');
-}, 5000);
+}, 10000);
 
 // ============================================
 // HELPERS & STATS
@@ -206,12 +264,14 @@ const download_video = async (url, target_path) => {
 
 const upload_to_r2 = async (file_path, job_id) => {
   const key = `interpolations/${job_id}.mp4`;
+  const file_stats = await stat(file_path);
   const file_stream = createReadStream(file_path);
 
   await s3_client.send(new PutObjectCommand({
     Bucket: R2_BUCKET_NAME,
     Key: key,
     Body: file_stream,
+    ContentLength: file_stats.size,
     ContentType: 'video/mp4',
   }));
 
@@ -341,7 +401,10 @@ const process_job = async (job_data, slot_num) => {
 // MAIN LOOP
 // ============================================
 const main = async () => {
-  console.log(`[worker] Initializing on host: ${MACHINE_ID} (Max Concurrency: ${CONCURRENCY})`);
+  console.log(
+    `[worker] Initializing on host: ${MACHINE_ID} ` +
+    `(Starting Concurrency: ${INITIAL_CONCURRENCY}, Max Cap: ${HARD_CAP_CONCURRENCY})`
+  );
 
   await mkdir(WORK_DIR, { recursive: true });
   await sync_stats_file();
@@ -349,7 +412,7 @@ const main = async () => {
   let empty_poll_count = 0;
 
   while (!is_shutting_down) {
-    if (active_job_promises.size >= CONCURRENCY || free_slots.length === 0) {
+    if (active_job_promises.size >= current_target_concurrency || free_slots.length === 0) {
       await Promise.race(active_job_promises);
       continue;
     }
@@ -372,7 +435,7 @@ const main = async () => {
     }
 
     empty_poll_count = 0;
-    const slot_num = free_slots.shift();
+    const slot_num = free_slots.shift() || (active_job_promises.size + 1);
 
     const job_promise = (async () => {
       try {
@@ -385,7 +448,7 @@ const main = async () => {
     })();
 
     active_job_promises.add(job_promise);
-    await sleep(200);
+    await sleep(250);
   }
 
   if (active_job_promises.size > 0) {
