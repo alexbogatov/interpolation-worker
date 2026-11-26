@@ -23,10 +23,40 @@ const JOB_TYPE = process.env.JOB_TYPE || 'interpolate';
 const MODEL = process.env.MODEL || 'interpolate-video';
 
 // Scaler & Worker Constraints
-const HARD_CAP_CONCURRENCY = 12;
-const INITIAL_CONCURRENCY = 4;
-const CPU_SCALE_THRESHOLD = 60.0;
-const CPU_SCALE_STEP = 2;
+// Each ffmpeg job (minterpolate + x264) realistically wants ~2 vCPU and
+// ~4.5 GB RAM. Default the slot count to vCPU/2 so a 32-vCPU box runs 16
+// slots instead of a hardcoded 12. MAX_CONCURRENCY overrides it explicitly.
+const CPU_COUNT = os.cpus().length;
+const TOTAL_MEM_GB = os.totalmem() / (1024 ** 3);
+
+const SLOTS_PER_CPU = 0.5;          // vCPU per concurrent ffmpeg job
+const EST_MEM_PER_SLOT_GB = 4.5;    // measured ~4.7 GB/job at 720p
+const MEM_HEADROOM_GB = 8;          // leave room for the OS + node
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+const compute_auto_cap = () => {
+  const by_cpu = Math.floor(CPU_COUNT * SLOTS_PER_CPU);
+  const by_mem = Math.floor((TOTAL_MEM_GB - MEM_HEADROOM_GB) / EST_MEM_PER_SLOT_GB);
+  return clamp(Math.min(by_cpu, by_mem), 1, 128);
+};
+
+const env_cap = parseInt(process.env.MAX_CONCURRENCY, 10);
+const auto_cap = compute_auto_cap();
+const HARD_CAP_CONCURRENCY = Number.isFinite(env_cap) && env_cap > 0
+  ? clamp(env_cap, 1, 128)
+  : auto_cap;
+
+// Start at half the cap (min 2) so the ramp has somewhere to go, but don't
+// creep up from 4 on a big box - that wastes the first few minutes.
+const INITIAL_CONCURRENCY = clamp(
+  parseInt(process.env.INITIAL_CONCURRENCY, 10) || Math.max(2, Math.ceil(HARD_CAP_CONCURRENCY / 2)),
+  1,
+  HARD_CAP_CONCURRENCY
+);
+
+const CPU_SCALE_THRESHOLD = parseFloat(process.env.CPU_SCALE_THRESHOLD) || 85.0;
+const CPU_SCALE_STEP = Math.max(1, parseInt(process.env.CPU_SCALE_STEP, 10) || 2);
 
 const POLL_INTERVAL_MS = (parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 5) * 1000;
 const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
@@ -98,30 +128,56 @@ const measure_cpu_percent = async (sample_duration_ms = 2000) => {
   return Math.max(0, Math.min(100, (1 - idle_delta / total_delta) * 100));
 };
 
-// Ramp Controller: Runs every 60 seconds
+// Ramp Controller: Runs every 20 seconds
+//
+// The old condition required active_job_promises.size >= current_target_concurrency,
+// which deadlocked: jobs finish and restart constantly, so the count hovers just
+// below target and the cap is never raised (observed stuck at 9/12 with 3 slots
+// idle and jobs waiting in download_queue). We now ramp whenever there is work
+// waiting and headroom, regardless of the instantaneous active count.
 setInterval(async () => {
   if (is_shutting_down) return;
+  if (current_target_concurrency >= HARD_CAP_CONCURRENCY) return;
 
-  if (active_job_promises.size >= current_target_concurrency && current_target_concurrency < HARD_CAP_CONCURRENCY) {
-    const cpu_pct = await measure_cpu_percent(2000);
+  const has_backlog = download_queue.length > 0;
+  const idle_slots = free_slots.length;
+  const under_target = active_job_promises.size < current_target_concurrency;
 
-    if (cpu_pct < CPU_SCALE_THRESHOLD) {
-      const added = Math.min(CPU_SCALE_STEP, HARD_CAP_CONCURRENCY - current_target_concurrency);
-      const old_target = current_target_concurrency;
-      current_target_concurrency += added;
+  // Nothing to do unless there is work we are failing to start.
+  if (!has_backlog && !under_target) return;
 
-      console.log(
-        `\n\x1b[36m[Autoscaler] CPU at ${cpu_pct.toFixed(1)}% (< ${CPU_SCALE_THRESHOLD}%). ` +
-        `Ramping concurrency up: ${old_target} -> ${current_target_concurrency} (Cap: ${HARD_CAP_CONCURRENCY})\x1b[0m\n`
-      );
-    } else {
-      console.log(
-        `\n\x1b[33m[Autoscaler] CPU load at ${cpu_pct.toFixed(1)}% (>= ${CPU_SCALE_THRESHOLD}%). ` +
-        `Holding concurrency at ${current_target_concurrency}.\x1b[0m\n`
-      );
-    }
+  // If slots are free AND jobs are queued, we are underutilised by definition:
+  // grow without waiting for a CPU sample.
+  if (has_backlog && idle_slots > 0) {
+    const added = Math.min(CPU_SCALE_STEP, HARD_CAP_CONCURRENCY - current_target_concurrency);
+    const old_target = current_target_concurrency;
+    current_target_concurrency += added;
+    console.log(
+      `\n\x1b[36m[Autoscaler] ${idle_slots} idle slot(s) with ${download_queue.length} job(s) queued. ` +
+      `Ramping concurrency up: ${old_target} -> ${current_target_concurrency} (Cap: ${HARD_CAP_CONCURRENCY})\x1b[0m\n`
+    );
+    return;
   }
-}, 60 * 1000);
+
+  // Otherwise measure CPU before growing.
+  const cpu_pct = await measure_cpu_percent(2000);
+
+  if (cpu_pct < CPU_SCALE_THRESHOLD) {
+    const added = Math.min(CPU_SCALE_STEP, HARD_CAP_CONCURRENCY - current_target_concurrency);
+    const old_target = current_target_concurrency;
+    current_target_concurrency += added;
+
+    console.log(
+      `\n\x1b[36m[Autoscaler] CPU at ${cpu_pct.toFixed(1)}% (< ${CPU_SCALE_THRESHOLD}%). ` +
+      `Ramping concurrency up: ${old_target} -> ${current_target_concurrency} (Cap: ${HARD_CAP_CONCURRENCY})\x1b[0m\n`
+    );
+  } else {
+    console.log(
+      `\n\x1b[33m[Autoscaler] CPU load at ${cpu_pct.toFixed(1)}% (>= ${CPU_SCALE_THRESHOLD}%). ` +
+      `Holding concurrency at ${current_target_concurrency}.\x1b[0m\n`
+    );
+  }
+}, 20 * 1000);
 
 // ============================================
 // PERIODIC SUMMARY PRINTER (Every 10 Seconds)
@@ -480,6 +536,12 @@ const main = async () => {
   console.log(
     `[worker] Initializing on host: ${MACHINE_ID} ` +
     `(Start: ${INITIAL_CONCURRENCY}, Cap: ${HARD_CAP_CONCURRENCY}, Threshold: ${CPU_SCALE_THRESHOLD}%)`
+  );
+  console.log(
+    `[worker] Resources: ${CPU_COUNT} vCPU, ${TOTAL_MEM_GB.toFixed(1)} GB RAM ` +
+    `-> auto cap ${auto_cap} (cpu ${Math.floor(CPU_COUNT * SLOTS_PER_CPU)}, ` +
+    `mem ${Math.floor((TOTAL_MEM_GB - MEM_HEADROOM_GB) / EST_MEM_PER_SLOT_GB)})` +
+    (Number.isFinite(env_cap) && env_cap > 0 ? ` [MAX_CONCURRENCY override: ${env_cap}]` : '')
   );
 
   await mkdir(WORK_DIR, { recursive: true });
